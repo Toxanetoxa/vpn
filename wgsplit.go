@@ -13,8 +13,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/skip2/go-qrcode"
 )
 
 /* ==========================
@@ -33,7 +31,6 @@ type Config struct {
 	Domains        []string // домены для split-tunnel
 	Resolvers      []string // DNS, по умолчанию ["1.1.1.1","8.8.8.8"]
 	OutputConfPath string   // путь к client.conf
-	OutputQRPath   string   // если задан — сгенерим PNG с QR (для iOS)
 }
 
 func fail(msg string, args ...interface{}) {
@@ -58,13 +55,14 @@ func defaultConfig() *Config {
 		DNS:            []string{"1.1.1.1", "2606:4700:4700::1111"},
 		MTU:            1420,
 		Resolvers:      []string{"1.1.1.1", "8.8.8.8"},
-		Domains:        []string{"chatgpt.com", "youtube.com", "www.youtube.com", "googlevideo.com", "ytimg.com", "youtubei.googleapis.com", "api.ipify.org"},
+		// ЖЁСТКО заданный список доменов на старте:
+		Domains:        []string{"chatgpt.com", "youtube.com", "www.youtube.com", "api.ipify.org"},
 		OutputConfPath: "client.conf",
-		// OutputQRPath: "client-ios.png",
 	}
 }
 
-// WireGuard ключ — это base64(32 байт). Для PoC сгенерим 32 случайных байта.
+// WireGuard private key — base64(32 байта). Для PoC просто сгенерим 32 случайных байта,
+// но в реале лучше передать настоящий ключ клиента через --priv.
 func genBase64(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -87,7 +85,6 @@ func main() {
 		flagDomains   string
 		flagResolvers string
 		flagOutConf   string
-		flagOutQR     string
 		flagDNS       string
 		flagMTU       int
 		flagIPv6      string
@@ -101,7 +98,6 @@ func main() {
 	flag.StringVar(&flagDomains, "domains", strings.Join(conf.Domains, ","), "Домены через запятую")
 	flag.StringVar(&flagResolvers, "resolvers", strings.Join(conf.Resolvers, ","), "DNS-резолверы через запятую")
 	flag.StringVar(&flagOutConf, "out", conf.OutputConfPath, "Путь к client.conf")
-	flag.StringVar(&flagOutQR, "qr", conf.OutputQRPath, "Путь к PNG с QR (опц.)")
 	flag.StringVar(&flagDNS, "dns", strings.Join(conf.DNS, ","), "DNS для клиента (через запятую)")
 	flag.IntVar(&flagMTU, "mtu", conf.MTU, "MTU для клиента")
 	flag.StringVar(&flagIPv6, "ipv6", conf.ClientIPv6, "IPv6 клиента (например fd00:8::2/128); пусто — не писать")
@@ -115,7 +111,6 @@ func main() {
 	conf.Domains = splitCSV(flagDomains)
 	conf.Resolvers = splitCSV(flagResolvers)
 	conf.OutputConfPath = flagOutConf
-	conf.OutputQRPath = flagOutQR
 	conf.DNS = splitCSV(flagDNS)
 	conf.MTU = flagMTU
 	conf.ClientIPv6 = flagIPv6
@@ -180,13 +175,6 @@ func doOnce(c *Config) error {
 	}
 	if err := os.WriteFile(c.OutputConfPath, []byte(body), 0o600); err != nil {
 		return err
-	}
-
-	// QR для iOS (опционально)
-	if c.OutputQRPath != "" {
-		if err := qrcode.WriteFile(body, qrcode.Medium, 512, c.OutputQRPath); err != nil {
-			return fmt.Errorf("qrencode: %w", err)
-		}
 	}
 	return nil
 }
