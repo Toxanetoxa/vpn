@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -13,9 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 )
 
 type Config struct {
