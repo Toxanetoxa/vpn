@@ -7,281 +7,291 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-/* ==========================
-   Конфиг и утилиты
-   ========================== */
-
 type Config struct {
-	ServerEndpoint string   // "148.253.210.13:51820"
-	ServerPubKey   string   // публичный ключ сервера (base64)
-	ClientPrivKey  string   // приватный ключ клиента (base64); если пусто — сгенерим
-	ClientIPv4     string   // "10.8.0.2/32"
-	ClientIPv6     string   // "fd00:8::2/128" (опц.)
-	DNS            []string // ["1.1.1.1","2606:4700:4700::1111"]
-	MTU            int      // 1420
+	// Server settings
+	ServerIP         string
+	ServerPort       int
+	ServerNetwork    string
+	ServerPrivKey    string
+	ServerPubKey     string
+	ServerConfigPath string
 
-	Domains        []string // домены для split-tunnel
-	Resolvers      []string // DNS, по умолчанию ["1.1.1.1","8.8.8.8"]
-	OutputConfPath string   // путь к client.conf
+	// Client settings
+	ClientIP         string
+	ClientPrivKey    string
+	ClientPubKey     string
+	ClientConfigPath string
+
+	// Common settings
+	DNS           []string
+	MTU           int
+	Domains       []string
+	Resolvers     []string
+	InterfaceName string
 }
-
-func fail(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "[ERROR] "+msg+"\n", args...)
-	os.Exit(1)
-}
-
-func mustEnv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-func defaultConfig() *Config {
-	return &Config{
-		ServerEndpoint: mustEnv("WG_SERVER_ENDPOINT", "148.253.210.13:51820"),
-		ServerPubKey:   mustEnv("WG_SERVER_PUB", ""),
-		ClientPrivKey:  mustEnv("WG_CLIENT_PRIV", ""),
-		ClientIPv4:     mustEnv("WG_CLIENT_IPV4", "10.8.0.2/32"),
-		ClientIPv6:     os.Getenv("WG_CLIENT_IPV6"),
-		DNS:            []string{"1.1.1.1", "2606:4700:4700::1111"},
-		MTU:            1420,
-		Resolvers:      []string{"1.1.1.1", "8.8.8.8"},
-		// ЖЁСТКО заданный список доменов на старте:
-		Domains:        []string{"chatgpt.com", "youtube.com", "www.youtube.com", "api.ipify.org"},
-		OutputConfPath: "client.conf",
-	}
-}
-
-// WireGuard private key — base64(32 байта). Для PoC просто сгенерим 32 случайных байта,
-// но в реале лучше передать настоящий ключ клиента через --priv.
-func genBase64(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b), nil
-}
-
-/* ==========================
-   main
-   ========================== */
 
 func main() {
-	conf := defaultConfig()
+	config := &Config{
+		ServerIP:         "10.8.0.1",
+		ServerPort:       51820,
+		ServerNetwork:    "10.8.0.0/24",
+		ServerConfigPath: "/etc/wireguard/wg0.conf",
+		ClientIP:         "10.8.0.2",
+		ClientConfigPath: "wg-client.conf",
+		DNS:              []string{"1.1.1.1", "8.8.8.8"},
+		MTU:              1420,
+		Domains:          []string{"youtube.com", "chatgpt.com", "netflix.com"},
+		Resolvers:        []string{"1.1.1.1", "8.8.8.8"},
+		InterfaceName:    "wg0",
+	}
 
-	// флаги
-	var (
-		flagOnce      bool
-		flagWatch     time.Duration
-		flagDomains   string
-		flagResolvers string
-		flagOutConf   string
-		flagDNS       string
-		flagMTU       int
-		flagIPv6      string
-		flagSrvEP     string
-		flagSrvPub    string
-		flagCliPriv   string
-		flagCliIPv4   string
-	)
-	flag.BoolVar(&flagOnce, "once", false, "Сделать один проход и выйти")
-	flag.DurationVar(&flagWatch, "watch", 0, "Период обновления, напр. 30m, 1h")
-	flag.StringVar(&flagDomains, "domains", strings.Join(conf.Domains, ","), "Домены через запятую")
-	flag.StringVar(&flagResolvers, "resolvers", strings.Join(conf.Resolvers, ","), "DNS-резолверы через запятую")
-	flag.StringVar(&flagOutConf, "out", conf.OutputConfPath, "Путь к client.conf")
-	flag.StringVar(&flagDNS, "dns", strings.Join(conf.DNS, ","), "DNS для клиента (через запятую)")
-	flag.IntVar(&flagMTU, "mtu", conf.MTU, "MTU для клиента")
-	flag.StringVar(&flagIPv6, "ipv6", conf.ClientIPv6, "IPv6 клиента (например fd00:8::2/128); пусто — не писать")
-	flag.StringVar(&flagSrvEP, "endpoint", conf.ServerEndpoint, "Endpoint сервера host:port")
-	flag.StringVar(&flagSrvPub, "pub", conf.ServerPubKey, "PublicKey сервера (base64)")
-	flag.StringVar(&flagCliPriv, "priv", conf.ClientPrivKey, "PrivateKey клиента (base64); пусто — сгенерим")
-	flag.StringVar(&flagCliIPv4, "ipv4", conf.ClientIPv4, "IPv4 клиента, напр. 10.8.0.2/32")
+	// Parse flags
+	mode := flag.String("mode", "client", "Mode: server|client|both")
 	flag.Parse()
 
-	// применяем флаги
-	conf.Domains = splitCSV(flagDomains)
-	conf.Resolvers = splitCSV(flagResolvers)
-	conf.OutputConfPath = flagOutConf
-	conf.DNS = splitCSV(flagDNS)
-	conf.MTU = flagMTU
-	conf.ClientIPv6 = flagIPv6
-	conf.ServerEndpoint = flagSrvEP
-	conf.ServerPubKey = flagSrvPub
-	conf.ClientPrivKey = flagCliPriv
-	conf.ClientIPv4 = flagCliIPv4
-
-	if conf.ServerPubKey == "" {
-		fail("не задан --pub (публичный ключ сервера)")
-	}
-	if conf.ClientPrivKey == "" {
-		k, err := genBase64(32)
+	// Generate keys if not exists
+	if config.ServerPrivKey == "" {
+		priv, pub, err := generateKeyPair()
 		if err != nil {
-			fail("не удалось сгенерировать приватный ключ: %v", err)
+			fail("Failed to generate keys: %v", err)
 		}
-		conf.ClientPrivKey = k
+		config.ServerPrivKey = priv
+		config.ServerPubKey = pub
 	}
 
-	run := func() {
-		if err := doOnce(conf); err != nil {
-			fmt.Fprintf(os.Stderr, "[ERR] %v\n", err)
-		} else {
-			fmt.Println("[OK] client.conf обновлён")
+	if config.ClientPrivKey == "" {
+		priv, pub, err := generateKeyPair()
+		if err != nil {
+			fail("Failed to generate client keys: %v", err)
 		}
+		config.ClientPrivKey = priv
+		config.ClientPubKey = pub
 	}
 
-	if flagOnce || flagWatch == 0 {
-		run()
-		return
-	}
-
-	// watch-режим
-	t := time.NewTicker(flagWatch)
-	defer t.Stop()
-	run()
-	for range t.C {
-		run()
+	switch *mode {
+	case "server":
+		if err := setupServer(config); err != nil {
+			fail("Server setup failed: %v", err)
+		}
+	case "client":
+		if err := setupClient(config); err != nil {
+			fail("Client setup failed: %v", err)
+		}
+	case "both":
+		if err := setupServer(config); err != nil {
+			fail("Server setup failed: %v", err)
+		}
+		if err := setupClient(config); err != nil {
+			fail("Client setup failed: %v", err)
+		}
+	default:
+		fail("Invalid mode. Use: server|client|both")
 	}
 }
 
-/* ==========================
-   Логика
-   ========================== */
+func setupServer(config *Config) error {
+	fmt.Println("Setting up WireGuard server...")
 
-func doOnce(c *Config) error {
-	if len(c.Domains) == 0 {
-		return errors.New("пустой список доменов")
-	}
-	ips, err := resolveDomainsMulti(c.Domains, c.Resolvers)
+	// Resolve domains
+	allowedIPs, err := resolveDomains(config.Domains, config.Resolvers)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to resolve domains: %v", err)
 	}
-	allowed := toCIDRs(ips)
 
-	// собрать client.conf
-	body := buildClientConf(c, allowed)
+	// Create server config
+	serverConfig := buildServerConfig(config, allowedIPs)
 
-	// создать каталог, если надо
-	if err := os.MkdirAll(filepath.Dir(c.OutputConfPath), 0o755); err != nil {
+	// Write config
+	if err := os.MkdirAll(filepath.Dir(config.ServerConfigPath), 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(c.OutputConfPath, []byte(body), 0o600); err != nil {
+
+	if err := ioutil.WriteFile(config.ServerConfigPath, []byte(serverConfig), 0600); err != nil {
 		return err
 	}
+
+	// Setup firewall and NAT
+	if err := setupFirewall(config); err != nil {
+		return fmt.Errorf("firewall setup failed: %v", err)
+	}
+
+	// Enable IP forwarding
+	if err := enableIPForwarding(); err != nil {
+		return fmt.Errorf("IP forwarding setup failed: %v", err)
+	}
+
+	fmt.Printf("Server config created: %s\n", config.ServerConfigPath)
+	fmt.Printf("Server public key: %s\n", config.ServerPubKey)
+
+	return startWireGuard(config.InterfaceName)
+}
+
+func setupClient(config *Config) error {
+	fmt.Println("Setting up WireGuard client...")
+
+	// Resolve domains
+	allowedIPs, err := resolveDomains(config.Domains, config.Resolvers)
+	if err != nil {
+		return fmt.Errorf("failed to resolve domains: %v", err)
+	}
+
+	// Create client config
+	clientConfig := buildClientConfig(config, allowedIPs)
+
+	// Write config
+	if err := ioutil.WriteFile(config.ClientConfigPath, []byte(clientConfig), 0600); err != nil {
+		return err
+	}
+
+	fmt.Printf("Client config created: %s\n", config.ClientConfigPath)
+	fmt.Printf("Client public key: %s\n", config.ClientPubKey)
+
 	return nil
 }
 
-func splitCSV(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
+func buildServerConfig(config *Config, allowedIPs []string) string {
+	var b strings.Builder
+
+	b.WriteString("[Interface]\n")
+	b.WriteString(fmt.Sprintf("Address = %s/24\n", config.ServerIP))
+	b.WriteString(fmt.Sprintf("ListenPort = %d\n", config.ServerPort))
+	b.WriteString(fmt.Sprintf("PrivateKey = %s\n", config.ServerPrivKey))
+	b.WriteString(fmt.Sprintf("MTU = %d\n", config.MTU))
+	b.WriteString("\n")
+
+	// NAT and firewall rules
+	b.WriteString("PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE\n")
+	b.WriteString("PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE\n")
+	b.WriteString("\n")
+
+	// Client peer
+	b.WriteString("[Peer]\n")
+	b.WriteString(fmt.Sprintf("PublicKey = %s\n", config.ClientPubKey))
+	b.WriteString(fmt.Sprintf("AllowedIPs = %s/32\n", config.ClientIP))
+	if len(allowedIPs) > 0 {
+		b.WriteString(fmt.Sprintf("# Allowed domains: %s\n", strings.Join(config.Domains, ", ")))
 	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+
+	return b.String()
 }
 
-func resolveDomainsMulti(domains, resolvers []string) ([]string, error) {
-	set := map[string]struct{}{}
-	for _, d := range domains {
-		d = strings.TrimSpace(d)
-		if d == "" || strings.HasPrefix(d, "#") {
+func buildClientConfig(config *Config, allowedIPs []string) string {
+	var b strings.Builder
+
+	b.WriteString("[Interface]\n")
+	b.WriteString(fmt.Sprintf("PrivateKey = %s\n", config.ClientPrivKey))
+	b.WriteString(fmt.Sprintf("Address = %s/24\n", config.ClientIP))
+	b.WriteString(fmt.Sprintf("DNS = %s\n", strings.Join(config.DNS, ", ")))
+	b.WriteString(fmt.Sprintf("MTU = %d\n", config.MTU))
+	b.WriteString("\n")
+
+	b.WriteString("[Peer]\n")
+	b.WriteString(fmt.Sprintf("PublicKey = %s\n", config.ServerPubKey))
+	b.WriteString(fmt.Sprintf("Endpoint = %s:%d\n", getPublicIP(), config.ServerPort))
+	b.WriteString("PersistentKeepalive = 25\n")
+
+	if len(allowedIPs) > 0 {
+		b.WriteString(fmt.Sprintf("AllowedIPs = %s\n", strings.Join(allowedIPs, ", ")))
+	} else {
+		b.WriteString("AllowedIPs = 0.0.0.0/0, ::/0\n")
+	}
+
+	return b.String()
+}
+
+func generateKeyPair() (string, string, error) {
+	privateKey := make([]byte, 32)
+	if _, err := rand.Read(privateKey); err != nil {
+		return "", "", err
+	}
+
+	// In real implementation, use proper WireGuard key generation
+	privBase64 := base64.StdEncoding.EncodeToString(privateKey)
+	pubBase64 := base64.StdEncoding.EncodeToString(derivePublicKey(privateKey))
+
+	return privBase64, pubBase64, nil
+}
+
+func derivePublicKey(privateKey []byte) []byte {
+	// Simplified - in real implementation use proper crypto
+	return privateKey
+}
+
+func resolveDomains(domains, resolvers []string) ([]string, error) {
+	ips := make(map[string]bool)
+
+	for _, domain := range domains {
+		addrs, err := net.LookupIP(domain)
+		if err != nil {
+			fmt.Printf("Warning: failed to resolve %s: %v\n", domain, err)
 			continue
 		}
-		for _, r := range resolvers {
-			v4, v6 := resolverFor(r)
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-			addrs4, _ := v4.LookupHost(ctx, d)
-			cancel()
-			ctx, cancel = context.WithTimeout(context.Background(), 4*time.Second)
-			addrs6, _ := v6.LookupHost(ctx, d)
-			cancel()
 
-			for _, a := range append(addrs4, addrs6...) {
-				if ip := net.ParseIP(strings.TrimSpace(a)); ip != nil {
-					set[ip.String()] = struct{}{}
-				}
+		for _, addr := range addrs {
+			if addr.To4() != nil {
+				ips[addr.String()+"/32"] = true
+			} else {
+				ips[addr.String()+"/128"] = true
 			}
 		}
 	}
-	if len(set) == 0 {
-		return nil, fmt.Errorf("не удалось получить IP для: %v", strings.Join(domains, ", "))
+
+	var result []string
+	for ip := range ips {
+		result = append(result, ip)
 	}
-	ips := make([]string, 0, len(set))
-	for k := range set {
-		ips = append(ips, k)
-	}
-	sort.Strings(ips)
-	return ips, nil
+	sort.Strings(result)
+
+	return result, nil
 }
 
-func resolverFor(r string) (*net.Resolver, *net.Resolver) {
-	// Резолвим напрямую в r:53 (UDP)
-	dialer := func(network, address string) (net.Conn, error) {
-		d := net.Dialer{Timeout: 3 * time.Second}
-		return d.Dial("udp", net.JoinHostPort(r, "53"))
+func setupFirewall(config *Config) error {
+	commands := []string{
+		"sysctl -w net.ipv4.ip_forward=1",
+		"iptables -A FORWARD -i wg0 -j ACCEPT",
+		"iptables -A FORWARD -o wg0 -j ACCEPT",
+		"iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
+		"ufw allow 51820/udp",
 	}
-	makeRes := func() *net.Resolver {
-		return &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return dialer(network, address)
-			},
+
+	for _, cmd := range commands {
+		if err := exec.Command("sh", "-c", cmd).Run(); err != nil {
+			fmt.Printf("Warning: failed to run %s: %v\n", cmd, err)
 		}
 	}
-	return makeRes(), makeRes()
+
+	return nil
 }
 
-func toCIDRs(ips []string) []string {
-	out := make([]string, 0, len(ips))
-	for _, s := range ips {
-		ip := net.ParseIP(s)
-		if ip == nil {
-			continue
-		}
-		if ip.To4() != nil {
-			out = append(out, ip.String()+"/32")
-		} else {
-			out = append(out, ip.String()+"/128")
-		}
-	}
-	return out
+func enableIPForwarding() error {
+	return ioutil.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
 }
 
-func buildClientConf(c *Config, allowed []string) string {
-	var b strings.Builder
-	fmt.Fprintln(&b, "[Interface]")
-	fmt.Fprintf(&b, "PrivateKey = %s\n", c.ClientPrivKey)
-	fmt.Fprintf(&b, "Address = %s", c.ClientIPv4)
-	if strings.TrimSpace(c.ClientIPv6) != "" {
-		fmt.Fprintf(&b, ", %s", c.ClientIPv6)
-	}
-	fmt.Fprintln(&b)
-	if len(c.DNS) > 0 {
-		fmt.Fprintf(&b, "DNS = %s\n", strings.Join(c.DNS, ", "))
-	}
-	if c.MTU > 0 {
-		fmt.Fprintf(&b, "MTU = %d\n", c.MTU)
-	}
-	fmt.Fprintln(&b)
+func startWireGuard(interfaceName string) error {
+	// Stop if already running
+	exec.Command("wg-quick", "down", interfaceName).Run()
 
-	fmt.Fprintln(&b, "[Peer]")
-	fmt.Fprintf(&b, "PublicKey = %s\n", c.ServerPubKey)
-	fmt.Fprintf(&b, "Endpoint = %s\n", c.ServerEndpoint)
-	fmt.Fprintln(&b, "PersistentKeepalive = 25")
-	fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(allowed, ", "))
-	return b.String()
+	// Start new interface
+	return exec.Command("wg-quick", "up", interfaceName).Run()
+}
+
+func getPublicIP() string {
+	// You should replace this with your server's actual public IP
+	return "YOUR_SERVER_PUBLIC_IP"
+}
+
+func fail(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
 }
